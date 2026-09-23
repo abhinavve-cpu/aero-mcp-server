@@ -1,226 +1,573 @@
-/**
- * MCP (Model Context Protocol) Server for Aero Agent System
- * Supported Transports:
- *  1. Streamable HTTP / JSON-RPC 2.0 (POST /mcp/messages)
- *  2. Server-Sent Events / SSE (GET /mcp/sse)
- *  3. REST Tool Fallbacks (POST /mcp/calendar, POST /mcp/expense-ledger)
- */
+require("dotenv").config();
 
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
+const express = require("express");
+
+const {
+  Server
+} = require("@modelcontextprotocol/sdk/server/index.js");
+
+const {
+  SSEServerTransport
+} = require("@modelcontextprotocol/sdk/server/sse.js");
+
+const {
+  CallToolRequestSchema,
+  ListToolsRequestSchema
+} = require("@modelcontextprotocol/sdk/types.js");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(bodyParser.json());
+const PORT = Number(process.env.PORT) || 3000;
 
-// Mock SQLite / Context Databases
-const calendarDatabase = [
-    { employee_id: "EMP1001", date: "2026-10-15", status: "AVAILABLE", conflicts: [] },
-    { employee_id: "EMP1001", date: "2026-10-20", status: "BUSY", conflicts: [{ title: "Strategy Sync", time: "10:00 - 12:00 IST" }] }
-];
+const OPENWEATHER_API_KEY =
+  process.env.OPENWEATHER_API_KEY;
 
-const expenseLedgerDatabase = {
-    "EMP1001": {
-        active_trip_id: "TRIP-2026-DEL",
-        base_currency: "INR",
-        daily_meals_spent: 2400.00,
-        daily_meals_cap: 5000.00,
-        daily_lodging_spent: 8500.00,
-        daily_lodging_cap: 12000.00
+/*
+|--------------------------------------------------------------------------
+| MCP SERVER
+|--------------------------------------------------------------------------
+*/
+
+const server = new Server(
+  {
+    name: "openweather-mcp",
+    version: "1.0.0"
+  },
+  {
+    capabilities: {
+      tools: {}
     }
-};
+  }
+);
 
-// =================================================================
-// 1. STREAMABLE HTTP / JSON-RPC 2.0 TRANSPORT (POST /mcp/messages)
-// =================================================================
-app.post('/mcp/messages', (req, res) => {
-    // Enable HTTP Streaming headers
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Transfer-Encoding', 'chunked');
+/*
+|--------------------------------------------------------------------------
+| MCP SESSIONS
+|--------------------------------------------------------------------------
+|
+| Each AEX connection gets its own SSE transport.
+|
+*/
 
-    const { jsonrpc, id, method, params } = req.body;
+const transports = new Map();
 
-    // Handle MCP Handshake
-    if (method === 'initialize') {
-        const response = {
-            jsonrpc: "2.0",
-            id: id || 1,
-            result: {
-                protocolVersion: "2026-01-15",
-                capabilities: { tools: {} },
-                serverInfo: { name: "Aero_Render_MCP_Server", version: "1.0.0" }
+/*
+|--------------------------------------------------------------------------
+| LIST TOOLS
+|--------------------------------------------------------------------------
+*/
+
+server.setRequestHandler(
+  ListToolsRequestSchema,
+  async () => {
+    console.log("[MCP] tools/list");
+
+    return {
+      tools: [
+        {
+          name: "get_weather",
+
+          description:
+            "Get the current weather conditions for a city using OpenWeather.",
+
+          inputSchema: {
+            type: "object",
+
+            properties: {
+              city: {
+                type: "string",
+                description:
+                  "City name, for example Delhi, London, Mumbai, or Tokyo."
+              }
+            },
+
+            required: ["city"],
+
+            additionalProperties: false
+          }
+        }
+      ]
+    };
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CALL TOOL
+|--------------------------------------------------------------------------
+*/
+
+server.setRequestHandler(
+  CallToolRequestSchema,
+  async (request) => {
+    const {
+      name,
+      arguments: args = {}
+    } = request.params;
+
+    console.log(
+      `[MCP] tools/call: ${name}`
+    );
+
+    if (name !== "get_weather") {
+      return {
+        isError: true,
+
+        content: [
+          {
+            type: "text",
+            text: `Unknown tool: ${name}`
+          }
+        ]
+      };
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validate city
+    |--------------------------------------------------------------------------
+    */
+
+    const city =
+      typeof args.city === "string"
+        ? args.city.trim()
+        : "";
+
+    if (!city) {
+      return {
+        isError: true,
+
+        content: [
+          {
+            type: "text",
+            text:
+              "The city parameter is required."
+          }
+        ]
+      };
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Check API key
+    |--------------------------------------------------------------------------
+    */
+
+    if (!OPENWEATHER_API_KEY) {
+      console.error(
+        "OPENWEATHER_API_KEY is missing."
+      );
+
+      return {
+        isError: true,
+
+        content: [
+          {
+            type: "text",
+            text:
+              "OPENWEATHER_API_KEY is not configured on the server."
+          }
+        ]
+      };
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | OpenWeather API
+    |--------------------------------------------------------------------------
+    */
+
+    try {
+      const url =
+        "https://api.openweathermap.org/data/2.5/weather" +
+        `?q=${encodeURIComponent(city)}` +
+        `&appid=${encodeURIComponent(
+          OPENWEATHER_API_KEY
+        )}` +
+        "&units=metric";
+
+      console.log(
+        `[Weather] Requesting weather for: ${city}`
+      );
+
+      const response = await fetch(url);
+
+      let data;
+
+      try {
+        data = await response.json();
+      } catch {
+        return {
+          isError: true,
+
+          content: [
+            {
+              type: "text",
+              text:
+                "OpenWeather returned an invalid response."
             }
+          ]
         };
-        return res.send(JSON.stringify(response));
-    }
+      }
 
-    // Handle Tool Listing Requests
-    if (method === 'tools/list') {
-        const response = {
-            jsonrpc: "2.0",
-            id: id || 1,
-            result: {
-                tools: [
-                    {
-                        name: "check_calendar_availability",
-                        description: "Check if an employee is clear to travel on a given date",
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                employee_id: { type: "string" },
-                                travel_date: { type: "string" }
-                            },
-                            required: ["employee_id", "travel_date"]
-                        }
-                    },
-                    {
-                        name: "query_expense_records",
-                        description: "Fetch daily expense caps and current spending from corporate ledger",
-                        inputSchema: {
-                            type: "object",
-                            properties: {
-                                employee_id: { type: "string" }
-                            },
-                            required: ["employee_id"]
-                        }
-                    }
-                ]
+      /*
+      |--------------------------------------------------------------------------
+      | OpenWeather error
+      |--------------------------------------------------------------------------
+      */
+
+      if (!response.ok) {
+        console.error(
+          "[OpenWeather Error]",
+          data
+        );
+
+        return {
+          isError: true,
+
+          content: [
+            {
+              type: "text",
+              text:
+                `OpenWeather error: ${
+                  data.message ||
+                  response.statusText
+                }`
             }
+          ]
         };
-        return res.send(JSON.stringify(response));
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Format result
+      |--------------------------------------------------------------------------
+      */
+
+      const weather =
+        data.weather?.[0];
+
+      const result = [
+        `Weather in ${data.name}, ${
+          data.sys?.country || ""
+        }`,
+
+        `Condition: ${
+          weather?.description || "Unknown"
+        }`,
+
+        `Temperature: ${
+          data.main?.temp ?? "N/A"
+        }°C`,
+
+        `Feels like: ${
+          data.main?.feels_like ?? "N/A"
+        }°C`,
+
+        `Humidity: ${
+          data.main?.humidity ?? "N/A"
+        }%`,
+
+        `Wind speed: ${
+          data.wind?.speed ?? "N/A"
+        } m/s`
+      ].join("\n");
+
+      console.log(
+        `[Weather] Successfully retrieved weather for ${city}`
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: result
+          }
+        ]
+      };
+
+    } catch (error) {
+      console.error(
+        "[Weather Error]",
+        error
+      );
+
+      return {
+        isError: true,
+
+        content: [
+          {
+            type: "text",
+            text:
+              `Failed to retrieve weather: ${error.message}`
+          }
+        ]
+      };
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ROOT / HEALTH
+|--------------------------------------------------------------------------
+*/
+
+app.get("/", (_req, res) => {
+  res.status(200).json({
+    status: "ok",
+    service: "openweather-mcp",
+    version: "1.0.0",
+    mcpEndpoint: "/sse"
+  });
+});
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({
+    status: "healthy"
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| SSE CONNECTION
+|--------------------------------------------------------------------------
+*/
+
+app.get("/sse", async (req, res) => {
+  console.log(
+    "[SSE] New AEX connection"
+  );
+
+  try {
+    const transport =
+      new SSEServerTransport(
+        "/messages",
+        res
+      );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Save session
+    |--------------------------------------------------------------------------
+    */
+
+    transports.set(
+      transport.sessionId,
+      transport
+    );
+
+    console.log(
+      `[SSE] Session created: ${transport.sessionId}`
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cleanup when connection closes
+    |--------------------------------------------------------------------------
+    */
+
+    res.on("close", async () => {
+      console.log(
+        `[SSE] Session closed: ${transport.sessionId}`
+      );
+
+      transports.delete(
+        transport.sessionId
+      );
+
+      try {
+        await transport.close();
+      } catch {
+        // Already closed.
+      }
+    });
+
+    /*
+    |--------------------------------------------------------------------------
+    | Connect MCP
+    |--------------------------------------------------------------------------
+    */
+
+    await server.connect(
+      transport
+    );
+
+    console.log(
+      `[SSE] MCP connection established: ${transport.sessionId}`
+    );
+
+  } catch (error) {
+    console.error(
+      "[SSE Error]",
+      error
+    );
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        error:
+          "Unable to establish MCP SSE connection."
+      });
+    }
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| MCP MESSAGE ENDPOINT
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+  "/messages",
+  async (req, res) => {
+
+    const sessionId =
+      req.query.sessionId;
+
+    if (!sessionId) {
+      return res.status(400).send(
+        "Missing sessionId."
+      );
     }
 
-    // Handle Tool Calls (tools/call)
-    if (method === 'tools/call') {
-        const toolName = params?.name;
-        const args = params?.arguments || {};
+    const transport =
+      transports.get(
+        String(sessionId)
+      );
 
-        if (toolName === 'check_calendar_availability') {
-            const empId = args.employee_id || "EMP1001";
-            const travelDate = args.travel_date || "2026-10-15";
-            const matched = calendarDatabase.find(
-                item => item.employee_id === empId && item.date === travelDate
-            ) || { employee_id: empId, date: travelDate, status: "AVAILABLE", conflicts: [] };
-
-            const response = {
-                jsonrpc: "2.0",
-                id: id || 1,
-                result: {
-                    content: [
-                        {
-                            type: "text",
-                            text: JSON.stringify({
-                                employee_id: empId,
-                                date_queried: travelDate,
-                                is_clear_for_travel: matched.status === "AVAILABLE",
-                                conflicting_events: matched.conflicts
-                            })
-                        }
-                    ]
-                }
-            };
-            return res.send(JSON.stringify(response));
-        }
-
-        if (toolName === 'query_expense_records') {
-            const empId = args.employee_id || "EMP1001";
-            const record = expenseLedgerDatabase[empId] || expenseLedgerDatabase["EMP1001"];
-
-            const response = {
-                jsonrpc: "2.0",
-                id: id || 1,
-                result: {
-                    content: [
-                        {
-                            type: "text",
-                            text: JSON.stringify(record)
-                        }
-                    ]
-                }
-            };
-            return res.send(JSON.stringify(response));
-        }
+    if (!transport) {
+      return res.status(400).send(
+        "MCP session not found."
+      );
     }
 
-    // Default Unknown Method Error
-    return res.status(400).json({
-        jsonrpc: "2.0",
-        id: id || null,
-        error: { code: -32601, message: "Method not found" }
+    try {
+      await transport.handlePostMessage(
+        req,
+        res
+      );
+
+    } catch (error) {
+      console.error(
+        "[MCP Message Error]",
+        error
+      );
+
+      if (!res.headersSent) {
+        res.status(500).send(
+          "Failed to process MCP message."
+        );
+      }
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| 404
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+  (_req, res) => {
+    res.status(404).json({
+      error: "Not found"
     });
-});
+  }
+);
 
-// ==========================================
-// 2. MCP SSE TRANSPORT (GET /mcp/sse)
-// ==========================================
-app.get('/mcp/sse', (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders();
+/*
+|--------------------------------------------------------------------------
+| START SERVER
+|--------------------------------------------------------------------------
+*/
 
-    // Broadcast endpoint binding event
-    res.write(`event: endpoint\ndata: /mcp/messages\n\n`);
+const httpServer =
+  app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
 
-    res.write(`data: ${JSON.stringify({
-        jsonrpc: "2.0",
-        method: "mcp/initialize",
-        params: { protocolVersion: "2026-01-15", serverName: "Aero_Render_MCP_Server" }
-    })}\n\n`);
+      console.log("");
+      console.log(
+        "================================"
+      );
+      console.log(
+        "OpenWeather MCP Server"
+      );
+      console.log(
+        "================================"
+      );
 
-    req.on('close', () => {
-        console.log('AEX Studio disconnected from MCP SSE stream.');
-    });
-});
+      console.log(
+        `Port: ${PORT}`
+      );
 
-// ==========================================
-// 3. LEGACY REST FALLBACKS (POST Endpoints)
-// ==========================================
-app.post('/mcp/calendar', (req, res) => {
-    const { employee_id = "EMP1001", travel_date = "2026-10-15" } = req.body;
-    const matched = calendarDatabase.find(
-        item => item.employee_id === employee_id && item.date === travel_date
-    ) || { employee_id, date: travel_date, status: "AVAILABLE", conflicts: [] };
+      console.log(
+        `Health: http://localhost:${PORT}/health`
+      );
 
-    res.json({
-        status: "SUCCESS",
-        context: {
-            employee_id,
-            date_queried: travel_date,
-            is_clear_for_travel: matched.status === "AVAILABLE",
-            conflicting_events: matched.conflicts
-        }
-    });
-});
+      console.log(
+        `SSE: http://localhost:${PORT}/sse`
+      );
 
-app.post('/mcp/expense-ledger', (req, res) => {
-    const { employee_id = "EMP1001" } = req.body;
-    const record = expenseLedgerDatabase[employee_id] || expenseLedgerDatabase["EMP1001"];
+      console.log(
+        "================================"
+      );
 
-    res.json({
-        status: "SUCCESS",
-        ledger_record: record
-    });
-});
+      console.log("");
+    }
+  );
 
-// Health check root
-app.get('/', (req, res) => {
-    res.json({
-        service: "aero-mcp-server",
-        status: "ok",
-        transports: ["streamable-http", "sse", "rest"],
-        endpoints: ["/mcp/messages", "/mcp/sse", "/mcp/calendar", "/mcp/expense-ledger"]
-    });
-});
+/*
+|--------------------------------------------------------------------------
+| SHUTDOWN
+|--------------------------------------------------------------------------
+*/
 
-// Start Server
-app.listen(PORT, () => {
-    console.log(`\n==================================================`);
-    console.log(` Aero Streamable MCP Server running on port ${PORT}`);
-    console.log(` Streamable Endpoint: POST http://localhost:${PORT}/mcp/messages`);
-    console.log(` SSE Stream: GET http://localhost:${PORT}/mcp/sse`);
-    console.log(`==================================================\n`);
-});
+async function shutdown(signal) {
+
+  console.log(
+    `${signal} received. Shutting down...`
+  );
+
+  for (
+    const [
+      sessionId,
+      transport
+    ]
+    of transports
+  ) {
+
+    console.log(
+      `Closing session: ${sessionId}`
+    );
+
+    try {
+      await transport.close();
+    } catch {
+      // Ignore.
+    }
+  }
+
+  transports.clear();
+
+  httpServer.close(() => {
+    console.log(
+      "Server closed."
+    );
+
+    process.exit(0);
+  });
+}
+
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
+
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
+);
