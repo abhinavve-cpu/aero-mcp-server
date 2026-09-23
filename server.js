@@ -14,6 +14,18 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(bodyParser.json());
 
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', service: 'aero-mcp-server' });
+});
+
+app.get('/', (req, res) => {
+    res.json({
+        service: 'aero-mcp-server',
+        status: 'ok',
+        endpoints: ['/health', '/mcp/sse', '/mcp/calendar', '/mcp/expense-ledger']
+    });
+});
+
 // Mock SQLite / Context Databases
 const calendarDatabase = [
     { employee_id: "EMP1001", date: "2026-10-15", status: "AVAILABLE", conflicts: [] },
@@ -90,9 +102,11 @@ app.post('/mcp/expense-ledger', (req, res) => {
 });
 
 // Start Server
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
+    const host = '0.0.0.0';
     console.log(`\n==================================================`);
-    console.log(` Aero Local MCP Server running on http://localhost:${PORT}`);
-    console.log(` MCP SSE Stream: http://localhost:${PORT}/mcp/sse`);
+    console.log(` Aero Local MCP Server running on http://${host}:${PORT}`);
+    console.log(` Health Check: http://${host}:${PORT}/health`);
+    console.log(` MCP SSE Stream: http://${host}:${PORT}/mcp/sse`);
     console.log(`==================================================\n`);
 });
